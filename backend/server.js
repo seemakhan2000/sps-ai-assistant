@@ -29,6 +29,10 @@ const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
+// ==========================================
+// CORS CONFIGURATION
+// ==========================================
+
 const allowedOrigins = new Set(
   [
     env.FRONTEND_URL,
@@ -40,20 +44,34 @@ const allowedOrigins = new Set(
     .filter(Boolean)
 );
 
-app.use(helmet());
-app.use(compression());
+// Allow Vercel production and preview deployments
+const isAllowedVercelPreview = (origin) => {
+  return /^https:\/\/sps-ai-assistant(?:-[a-z0-9-]+)?\.vercel\.app$/i.test(
+    origin
+  );
+};
 
-app.use(cors({
+const corsOptions = {
   origin(origin, callback) {
     const normalizedOrigin = origin?.replace(/\/$/, "");
 
-    if (!origin || allowedOrigins.has(normalizedOrigin)) {
+    if (
+      !origin ||
+      allowedOrigins.has(normalizedOrigin) ||
+      isAllowedVercelPreview(normalizedOrigin)
+    ) {
       return callback(null, true);
     }
 
-    return callback(new Error("Origin not allowed by CORS."));
+    console.error("Blocked CORS origin:", origin);
+
+    return callback(
+      new Error("Origin not allowed by CORS.")
+    );
   },
+
   credentials: true,
+
   methods: [
     "GET",
     "POST",
@@ -61,10 +79,26 @@ app.use(cors({
     "PATCH",
     "DELETE",
     "OPTIONS"
-  ]
-}));
+  ],
 
-app.use(express.json({ limit: "1mb" }));
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization"
+  ]
+};
+
+// ==========================================
+// GLOBAL MIDDLEWARE
+// ==========================================
+
+app.use(helmet());
+app.use(compression());
+
+app.use(cors(corsOptions));
+
+app.use(express.json({
+  limit: "1mb"
+}));
 
 app.use(express.urlencoded({
   extended: true,
@@ -73,11 +107,16 @@ app.use(express.urlencoded({
 
 app.use(cookieParser());
 
+// ==========================================
+// RATE LIMITING
+// ==========================================
+
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 200,
   standardHeaders: "draft-8",
   legacyHeaders: false,
+
   message: {
     success: false,
     message: "Too many requests. Please try again later."
@@ -86,8 +125,12 @@ const apiLimiter = rateLimit({
 
 app.use("/api", apiLimiter);
 
+// ==========================================
+// HEALTH CHECK
+// ==========================================
+
 app.get("/api/health", (req, res) => {
-  res.json({
+  res.status(200).json({
     success: true,
     application: "SPS AI Assistant API",
     status: "healthy",
@@ -95,11 +138,19 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// ==========================================
+// API ROUTES
+// ==========================================
+
 app.use("/api/auth", authRoutes);
 app.use("/api/sessions", sessionRoutes);
 app.use("/api/documents", documentRoutes);
 app.use("/api/models", modelRoutes);
 app.use("/api", answerRoutes);
+
+// ==========================================
+// ROOT ROUTE
+// ==========================================
 
 app.get("/", (req, res) => {
   res.json({
@@ -108,10 +159,17 @@ app.get("/", (req, res) => {
   });
 });
 
+// ==========================================
+// ERROR HANDLING
+// ==========================================
+
 app.use(notFound);
 app.use(errorHandler);
 
-// Database connection reuse for serverless requests
+// ==========================================
+// DATABASE CONNECTION REUSE
+// ==========================================
+
 let databaseConnection;
 
 async function connectToDatabase() {
@@ -125,7 +183,10 @@ async function connectToDatabase() {
   return databaseConnection;
 }
 
-// Local development
+// ==========================================
+// LOCAL DEVELOPMENT SERVER
+// ==========================================
+
 if (process.env.NODE_ENV !== "production") {
   const httpServer = http.createServer(app);
 
@@ -153,9 +214,13 @@ if (process.env.NODE_ENV !== "production") {
     console.log("Shutting down SPS API...");
 
     httpServer.close(async () => {
-      const mongoose = await import("mongoose");
-      await mongoose.default.disconnect();
-      process.exit(0);
+      try {
+        const mongoose = await import("mongoose");
+
+        await mongoose.default.disconnect();
+      } finally {
+        process.exit(0);
+      }
     });
   }
 
@@ -163,6 +228,9 @@ if (process.env.NODE_ENV !== "production") {
   process.on("SIGINT", shutdown);
 }
 
+// ==========================================
+// VERCEL SERVERLESS HANDLER
+// ==========================================
 
 export default async function handler(req, res) {
   try {
