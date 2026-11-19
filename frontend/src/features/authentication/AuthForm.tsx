@@ -271,14 +271,7 @@ export default function AuthForm({ mode }: Props) {
                     Password
                   </label>
 
-                  {!isRegister && (
-                    <Link
-                      href="/forgot-password"
-                      className="text-xs font-semibold text-blue-600 transition hover:text-blue-800"
-                    >
-                      Forgot password?
-                    </Link>
-                  )}
+                  
                 </div>
 
                 <div className="relative">
