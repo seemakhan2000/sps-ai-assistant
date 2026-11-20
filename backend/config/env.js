@@ -1,3 +1,4 @@
+
 import dotenv from "dotenv";
 import { z } from "zod";
 
@@ -18,6 +19,8 @@ const envSchema = z.object({
 
   FRONTEND_URL: z.string().url(),
 
+  FRONTEND_URLS: z.string().optional().default(""),
+
   COOKIE_SECURE: z
     .enum(["true", "false"])
     .default("false"),
@@ -37,7 +40,21 @@ if (!result.success) {
     result.error.flatten().fieldErrors
   );
 
-  process.exit(1);
+  throw new Error("Invalid environment configuration.");
 }
 
-export const env = Object.freeze(result.data);
+const parsedEnv = result.data;
+
+// Production must use secure cross-origin cookies.
+if (parsedEnv.NODE_ENV === "production") {
+  if (
+    parsedEnv.COOKIE_SECURE !== "true" ||
+    parsedEnv.COOKIE_SAME_SITE !== "none"
+  ) {
+    throw new Error(
+      "Production requires COOKIE_SECURE=true and COOKIE_SAME_SITE=none."
+    );
+  }
+}
+
+export const env = Object.freeze(parsedEnv);

@@ -33,18 +33,21 @@ app.set("trust proxy", 1);
 // CORS CONFIGURATION
 // ==========================================
 
+const normalizeOrigin = (url) =>
+  url?.trim().replace(/\/+$/, "");
+
 const allowedOrigins = new Set(
   [
     env.FRONTEND_URL,
+    ...(env.FRONTEND_URLS || "").split(","),
     "http://localhost:3000",
-    "http://localhost:3001",
-    ...(env.FRONTEND_URLS || "").split(",")
+    "http://localhost:3001"
   ]
-    .map((url) => url?.trim().replace(/\/$/, ""))
+    .map(normalizeOrigin)
     .filter(Boolean)
 );
 
-// Allow Vercel production and preview deployments
+// Allow approved SPS Vercel deployments.
 const isAllowedVercelPreview = (origin) => {
   return /^https:\/\/sps-ai-assistant(?:-[a-z0-9-]+)?\.vercel\.app$/i.test(
     origin
@@ -53,12 +56,15 @@ const isAllowedVercelPreview = (origin) => {
 
 const corsOptions = {
   origin(origin, callback) {
-    const normalizedOrigin = origin?.replace(/\/$/, "");
+    const normalizedOrigin = normalizeOrigin(origin);
 
     if (
       !origin ||
       allowedOrigins.has(normalizedOrigin) ||
-      isAllowedVercelPreview(normalizedOrigin)
+      (
+        env.NODE_ENV === "production" &&
+        isAllowedVercelPreview(normalizedOrigin)
+      )
     ) {
       return callback(null, true);
     }
@@ -187,7 +193,7 @@ async function connectToDatabase() {
 // LOCAL DEVELOPMENT SERVER
 // ==========================================
 
-if (process.env.NODE_ENV !== "production") {
+if (env.NODE_ENV !== "production") {
   const httpServer = http.createServer(app);
 
   initializeSockets(httpServer);
@@ -203,7 +209,6 @@ if (process.env.NODE_ENV !== "production") {
       });
     } catch (error) {
       console.error("Server startup failed:", error);
-
       process.exit(1);
     }
   }
@@ -216,7 +221,6 @@ if (process.env.NODE_ENV !== "production") {
     httpServer.close(async () => {
       try {
         const mongoose = await import("mongoose");
-
         await mongoose.default.disconnect();
       } finally {
         process.exit(0);
@@ -235,7 +239,6 @@ if (process.env.NODE_ENV !== "production") {
 export default async function handler(req, res) {
   try {
     await connectToDatabase();
-
     return app(req, res);
   } catch (error) {
     console.error("Database connection error:", error);
