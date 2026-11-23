@@ -116,7 +116,7 @@ const apiLimiter = rateLimit({
   limit: 200,
   standardHeaders: "draft-8",
   legacyHeaders: false,
-
+  skip: (req) => req.path.endsWith("/transcribe"),
   message: {
     success: false,
     message: "Too many requests. Please try again later."
