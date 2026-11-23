@@ -29,6 +29,12 @@ export type AnswerRequest = {
   image?: string;
 };
 
+export type TranscribeRequest = {
+  audio: string;
+  mimeType: string;
+  language: string;
+};
+
 type Props = {
   stream: MediaStream | null;
   language?: string;
@@ -38,6 +44,8 @@ type Props = {
   title?: string;
   /** Connect your AI backend here. Return the answer text. */
   onRequestAnswer?: (request: AnswerRequest) => Promise<string>;
+  /** Send a tab-audio chunk to speech-to-text. Return the transcript text. */
+  onTranscribeAudio?: (request: TranscribeRequest) => Promise<string>;
   /** Called for every final transcript line (use it to save to the DB). */
   onTranscriptLine?: (text: string) => void;
   onExit: () => void;
@@ -76,10 +84,34 @@ const LANGUAGES = [
 const ghostBtn =
   "flex h-10 items-center gap-2 rounded-lg border border-[#1F2F5E] bg-[#0C1738]/90 px-4 text-[14px] font-medium text-[#DCE4FA] backdrop-blur transition hover:bg-[#15275A] disabled:cursor-not-allowed disabled:opacity-50";
 
+/* Tab audio is cut into chunks of this length and sent to the backend. */
+const CHUNK_MS = 8000;
+/* Chunks quieter than this (0-128 scale) are treated as silence and skipped. */
+const SILENCE_THRESHOLD = 8;
+
+const QUESTION_RE =
+  /\?|(^|[.!]\s+)(what|why|how|when|where|who|which|can|could|do|does|did|is|are|will|would|should|have|has|tell me|explain|describe|walk me|give me|difference)\b/i;
+
+function looksLikeQuestion(text: string) {
+  return text.trim().length > 6 && QUESTION_RE.test(text.trim());
+}
+
 function formatTime(total: number) {
   const m = Math.floor(total / 60);
   const s = total % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = String(reader.result || "");
+      resolve(result.split(",")[1] || "");
+    };
+    reader.onerror = () => reject(new Error("Unable to read audio."));
+    reader.readAsDataURL(blob);
+  });
 }
 
 /* -------------------------------------------------
@@ -94,6 +126,7 @@ export default function LiveSession({
   planLabel = "Free",
   title = "AI Assistant",
   onRequestAnswer,
+  onTranscribeAudio,
   onTranscriptLine,
   onExit,
 }: Props) {
@@ -103,6 +136,7 @@ export default function LiveSession({
   const [remaining, setRemaining] = useState(durationSeconds);
 
   const [listening, setListening] = useState(false);
+  const [tabListening, setTabListening] = useState(false);
   const [interim, setInterim] = useState("");
   const [lines, setLines] = useState<Line[]>([]);
 
@@ -116,6 +150,7 @@ export default function LiveSession({
   const videoWrapRef = useRef<HTMLDivElement>(null);
   const recRef = useRef<RecognitionLike | null>(null);
   const wantListeningRef = useRef(false);
+  const tabCleanupRef = useRef<(() => void) | null>(null);
   const idRef = useRef(0);
   const streamRef = useRef<MediaStream | null>(initialStream);
   const linesRef = useRef<Line[]>([]);
@@ -124,6 +159,8 @@ export default function LiveSession({
   const requestRef = useRef<(q: string, image?: string) => void>(() => {});
   const transcriptCbRef = useRef(onTranscriptLine);
   transcriptCbRef.current = onTranscriptLine;
+  const transcribeRef = useRef(onTranscribeAudio);
+  transcribeRef.current = onTranscribeAudio;
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const answersEndRef = useRef<HTMLDivElement>(null);
 
@@ -146,7 +183,7 @@ export default function LiveSession({
 
   useEffect(() => {
     if (!notice) return;
-    const timer = setTimeout(() => setNotice(""), 3500);
+    const timer = setTimeout(() => setNotice(""), 5000);
     return () => clearTimeout(timer);
   }, [notice]);
 
@@ -162,11 +199,23 @@ export default function LiveSession({
     if (!stream) return;
 
     const track = stream.getVideoTracks()[0];
-    const handleEnded = () => setStream(null);
+    const handleEnded = () => {
+      tabCleanupRef.current?.();
+      setStream(null);
+    };
 
     track?.addEventListener("ended", handleEnded);
 
     return () => track?.removeEventListener("ended", handleEnded);
+  }, [stream]);
+
+  // Warn once if the shared stream has no audio.
+  useEffect(() => {
+    if (stream && stream.getAudioTracks().length === 0) {
+      setNotice(
+        'No tab audio was shared. Click "Change tab", pick a Chrome Tab and tick "Also share tab audio".'
+      );
+    }
   }, [stream]);
 
   async function changeTab() {
@@ -184,9 +233,14 @@ export default function LiveSession({
         systemAudio: "include",
       } as unknown as DisplayMediaStreamOptions);
 
+      tabCleanupRef.current?.();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       setAudioOn(true);
       setStream(next);
+
+      if (next.getAudioTracks().length > 0) {
+        setNotice('Tab audio shared. Click "Connect" to start listening.');
+      }
     } catch {
       setNotice("Sharing was cancelled.");
     }
@@ -302,7 +356,7 @@ export default function LiveSession({
     );
   }
 
-  /* ---------------- Speech to text (microphone) ---------------- */
+  /* ---------------- Transcript lines ---------------- */
 
   const addLine = useCallback((text: string) => {
     const id = ++idRef.current;
@@ -310,10 +364,151 @@ export default function LiveSession({
     setLines((previous) => [...previous, { id, text }]);
     transcriptCbRef.current?.(text);
 
-    if (autoAnswerRef.current) {
+    if (autoAnswerRef.current && looksLikeQuestion(text)) {
       requestRef.current(text);
     }
   }, []);
+
+  /* ---------------- Tab audio -> speech to text ---------------- */
+
+  const sendChunk = useCallback(
+    async (blob: Blob, mime: string) => {
+      const transcribe = transcribeRef.current;
+      if (!transcribe) return;
+
+      try {
+        setInterim("Transcribing...");
+        const audio = await blobToBase64(blob);
+        const text = (
+          await transcribe({
+            audio,
+            mimeType: mime.split(";")[0],
+            language: langRef.current,
+          })
+        ).trim();
+
+        if (text) addLine(text);
+      } catch {
+        /* skip this chunk, the next one will continue */
+      } finally {
+        setInterim("");
+      }
+    },
+    [addLine]
+  );
+
+  const startTabTranscription = useCallback(() => {
+    const audioTrack = streamRef.current?.getAudioTracks()[0];
+
+    if (!audioTrack) {
+      setNotice(
+        'No tab audio. Click "Change tab", pick a Chrome Tab and tick "Also share tab audio".'
+      );
+      return false;
+    }
+
+    if (typeof MediaRecorder === "undefined") {
+      setNotice("Audio recording is not supported in this browser.");
+      return false;
+    }
+
+    const mime = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+    ].find((type) => MediaRecorder.isTypeSupported(type));
+
+    if (!mime) {
+      setNotice("This browser cannot record tab audio. Use Chrome or Edge.");
+      return false;
+    }
+
+    tabCleanupRef.current?.();
+
+    const audioStream = new MediaStream([audioTrack]);
+
+    // Simple volume meter so silent chunks are not sent.
+    const AudioCtx =
+      window.AudioContext || (window as any).webkitAudioContext;
+    const ctx: AudioContext = new AudioCtx();
+    const source = ctx.createMediaStreamSource(audioStream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+
+    const buffer = new Uint8Array(analyser.fftSize);
+    let peak = 0;
+
+    const meter = setInterval(() => {
+      analyser.getByteTimeDomainData(buffer);
+      for (let i = 0; i < buffer.length; i++) {
+        const diff = Math.abs(buffer[i] - 128);
+        if (diff > peak) peak = diff;
+      }
+    }, 80);
+
+    let active = true;
+    let recorder: MediaRecorder | null = null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    // Each chunk is a separate, complete audio file.
+    const cycle = () => {
+      if (!active) return;
+
+      const parts: Blob[] = [];
+      let heard = 0;
+      const rec = new MediaRecorder(audioStream, { mimeType: mime });
+
+      recorder = rec;
+      peak = 0;
+
+      rec.ondataavailable = (event) => {
+        if (event.data.size > 0) parts.push(event.data);
+      };
+
+      rec.onstop = () => {
+        const blob = new Blob(parts, { type: mime });
+
+        if (heard > SILENCE_THRESHOLD && blob.size > 1500) {
+          void sendChunk(blob, mime);
+        }
+      };
+
+      rec.start();
+
+      timer = setTimeout(() => {
+        heard = peak;
+        if (rec.state === "recording") rec.stop();
+        cycle();
+      }, CHUNK_MS);
+    };
+
+    tabCleanupRef.current = () => {
+      active = false;
+      clearInterval(meter);
+      if (timer) clearTimeout(timer);
+
+      try {
+        if (recorder && recorder.state === "recording") recorder.stop();
+      } catch {
+        /* already stopped */
+      }
+
+      ctx.close().catch(() => {});
+      tabCleanupRef.current = null;
+      setTabListening(false);
+      setListening(false);
+      setInterim("");
+    };
+
+    cycle();
+    setTabListening(true);
+    setListening(true);
+
+    return true;
+  }, [sendChunk]);
+
+  /* ---------------- Microphone speech to text ---------------- */
 
   const stopListening = useCallback(() => {
     wantListeningRef.current = false;
@@ -359,13 +554,26 @@ export default function LiveSession({
     };
 
     rec.onerror = (event) => {
-      if (
-        event.error === "not-allowed" ||
-        event.error === "service-not-allowed"
-      ) {
-        wantListeningRef.current = false;
-        setListening(false);
-        setNotice("Microphone permission was denied.");
+      const error = String(event.error || "");
+
+      // Harmless: silence or a normal stop.
+      if (error === "no-speech" || error === "aborted") return;
+
+      wantListeningRef.current = false;
+      setListening(false);
+
+      if (error === "not-allowed" || error === "service-not-allowed") {
+        setNotice(
+          "Microphone permission was denied. Allow the mic in the browser address bar."
+        );
+      } else if (error === "audio-capture") {
+        setNotice("No microphone found, or another app is using it.");
+      } else if (error === "network") {
+        setNotice(
+          "Speech service could not be reached. Check your internet connection and try again."
+        );
+      } else {
+        setNotice(`Speech recognition error: ${error || "unknown"}.`);
       }
     };
 
@@ -383,20 +591,39 @@ export default function LiveSession({
 
     wantListeningRef.current = true;
     recRef.current = rec;
-    rec.start();
-    setListening(true);
+
+    try {
+      rec.start();
+      setListening(true);
+    } catch {
+      wantListeningRef.current = false;
+      setListening(false);
+      setNotice("Could not start the microphone. Please try again.");
+    }
   }, [addLine]);
 
-  function toggleListening() {
-    if (listening) stopListening();
-    else startListening();
+ function toggleListening() {
+  if (listening) {
+    tabCleanupRef.current?.();
+    stopListening();
+    return;
   }
+
+  if (hasAudio) {
+    stopListening();
+    startTabTranscription();
+  } else {
+    startListening();
+  }
+}
+    
 
   function changeLanguage(next: string) {
     setLang(next);
     langRef.current = next;
 
-    if (listening) {
+    // Tab audio reads the language on every chunk. Only the mic must restart.
+    if (listening && !tabCleanupRef.current) {
       stopListening();
       setTimeout(startListening, 250);
     }
@@ -412,6 +639,7 @@ export default function LiveSession({
   const exit = useCallback(() => {
     wantListeningRef.current = false;
     recRef.current?.stop();
+    tabCleanupRef.current?.();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     onExit();
   }, [onExit]);
@@ -432,6 +660,7 @@ export default function LiveSession({
     return () => {
       wantListeningRef.current = false;
       recRef.current?.stop();
+      tabCleanupRef.current?.();
       streamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
@@ -489,6 +718,11 @@ export default function LiveSession({
               type="button"
               onClick={toggleTabAudio}
               disabled={!hasAudio}
+              title={
+                hasAudio
+                  ? undefined
+                  : 'No tab audio shared. Use "Change tab" and tick "Also share tab audio".'
+              }
               className={ghostBtn}
             >
               {audioOn ? <VolumeX size={15} /> : <Volume2 size={15} />}
@@ -510,8 +744,12 @@ export default function LiveSession({
                   : "border-[#1F2F5E] bg-[#0C1738] text-[#DCE4FA] hover:bg-[#15275A]"
               }`}
             >
-              {listening ? "Listening" : "Connect"}
-              <Mic size={15} />
+              {listening
+                ? tabListening
+                  ? "Listening to tab"
+                  : "Listening"
+                : "Connect"}
+              {tabListening ? <Volume2 size={15} /> : <Mic size={15} />}
             </button>
 
             <button
@@ -553,9 +791,23 @@ export default function LiveSession({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5 text-[16px] leading-7">
           {lines.length === 0 && !interim ? (
-            <p className="text-[#9AA8CF]">
-              {listening ? "Listening..." : "Click Connect to start listening."}
-            </p>
+            <div className="text-[#9AA8CF]">
+              <p>
+                {listening
+                  ? tabListening
+                    ? "Listening to the shared tab..."
+                    : "Listening..."
+                  : "Click Connect to start listening."}
+              </p>
+
+              {stream && !hasAudio && (
+                <p className="mt-2 text-[14px] text-[#F5C26B]">
+                  Tab audio is not shared, so Connect will use your microphone.
+                  To capture the other person, click &quot;Change tab&quot;,
+                  pick a Chrome Tab and tick &quot;Also share tab audio&quot;.
+                </p>
+              )}
+            </div>
           ) : (
             <>
               {lines.map((line) => (

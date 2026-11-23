@@ -20,6 +20,7 @@ import { sessionActions } from "../utils/session.actions";
 
 import EditSessionModal from "./EditSessionModal";
 import SessionLauncher from "./SessionLauncher";
+import SessionDetailsLoader from "./SessionDetailsLoader";
 
 /* -------------------------------------------------
    Types & helpers
@@ -518,6 +519,7 @@ export default function SessionsBoard({
   const [now, setNow] = useState(() => Date.now());
   const [launching, setLaunching] = useState<unknown | null>(null);
   const [editing, setEditing] = useState<unknown | null>(null);
+  const [detailsFor, setDetailsFor] = useState<unknown | null>(null);
   const [deleting, setDeleting] = useState<unknown | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState("");
@@ -651,7 +653,9 @@ export default function SessionsBoard({
               busy={Boolean(busyId) && String(busyId) === id}
               onOpen={() => setLaunching(item)}
               onToggleTranscript={() => callToggle(item)}
-              onDetails={onDetails ? () => onDetails(id) : undefined}
+              onDetails={
+                onDetails ? () => onDetails(id) : () => setDetailsFor(item)
+              }
               onEdit={
                 getStatus(item) === "ready"
                   ? () => setEditing(item)
@@ -847,6 +851,13 @@ export default function SessionsBoard({
             {renderCards(past)}
           </Group>
         </div>
+      )}
+
+      {detailsFor !== null && (
+        <SessionDetailsLoader
+          session={detailsFor}
+          onClose={() => setDetailsFor(null)}
+        />
       )}
 
       {launching !== null && (

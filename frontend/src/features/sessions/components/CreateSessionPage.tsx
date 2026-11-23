@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Bot, Video, X } from "lucide-react";
 
@@ -13,6 +13,8 @@ import { answerService } from "../utils/Answer.service";
 
 import { SESSION_ROUTES } from "../constants";
 import { useSessionFormOptions } from "../hooks/useSessionFormOptions";
+import { apiFetch } from "@/src/features/lib/api";
+import { transcribeService } from "../utils/transcribe.service";
 
 import type {
   CreateSessionPayload,
@@ -71,6 +73,22 @@ function extractSessionId(result: unknown): string {
   return "";
 }
 
+function formatDuration(ms: number) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return m > 0 ? `${m} min ${s} sec` : `${s} sec`;
+}
+
+function languageName(code?: string) {
+  if (!code) return "-";
+  try {
+    return new Intl.DisplayNames(["en"], { type: "language" }).of(code) ?? code;
+  } catch {
+    return code;
+  }
+}
+
 export default function CreateSessionPage({
   embedded = false,
   defaultMode = "interview",
@@ -95,6 +113,12 @@ export default function CreateSessionPage({
   // exit -> leave/end -> feedback -> details -> rate (one by one)
   const [showWrapUp, setShowWrapUp] = useState(false);
   const [transcript, setTranscript] = useState<string[]>([]);
+
+  // call details (shown in "Call details" tab)
+  const startedAtRef = useRef<number | null>(null);
+  const [callDetails, setCallDetails] = useState<
+    { label: string; value: string }[]
+  >([]);
 
   const [sessionId, setSessionId] = useState("");
   const [createdValues, setCreatedValues] =
@@ -157,18 +181,38 @@ export default function CreateSessionPage({
     setShowStart(true);
   }
   function handleConnect(stream: MediaStream, device: string) {
-    void device;
-    setLiveStream(stream);
-    setShowConnect(false);
-    setShowLive(true);
+  void device;
+  startedAtRef.current = Date.now();
+
+  if (sessionId) {
+    apiFetch(`/sessions/${sessionId}/start`, { method: "POST" }).catch(() => {});
   }
+
+  setLiveStream(stream);
+  setShowConnect(false);
+  setShowLive(true);
+}
 
   /* -----------------------------------------------
      Exit flow
   ------------------------------------------------ */
 
-  // Exit button in LiveSession -> open the first modal
+  // Exit button in LiveSession -> build call details, open first modal
   function handleExitLive() {
+    const started = startedAtRef.current ?? Date.now();
+    const v = createdValues;
+
+    setCallDetails([
+      {
+        label: "Type",
+        value: v ? v.mode.charAt(0).toUpperCase() + v.mode.slice(1) : "Call",
+      },
+      { label: "Date", value: new Date(started).toLocaleString() },
+      { label: "Duration", value: formatDuration(Date.now() - started) },
+      { label: "Language", value: languageName(v?.language) },
+      { label: "Transcript lines", value: String(transcript.length) },
+    ]);
+
     setShowWrapUp(true);
   }
 
@@ -180,17 +224,26 @@ export default function CreateSessionPage({
     setLiveStream(null);
     router.push(SESSION_ROUTES.afterCreate);
   }
+async function handleEndSession() {
+  liveStream?.getTracks().forEach((t) => t.stop());
 
-  async function handleEndSession() {
-    // Stop the mic/screen immediately, then tell the backend.
-    liveStream?.getTracks().forEach((t) => t.stop());
-    try {
-      // Connect your real endpoint here, e.g. sessionService.end(sessionId)
-      await (sessionService as any).end?.(sessionId);
-    } catch {
-      /* don't block the feedback flow if this fails */
+  try {
+    await apiFetch(`/sessions/${sessionId}/end`, { method: "POST" });
+  } catch (err) {
+    const status = (err as { status?: number })?.status;
+
+    // 409 = session already ended (ya start nahi hua). Ye masla nahi, ignore karein.
+    if (status === 409) {
+      console.warn("Session already ended or was not started.");
+      return;
     }
+
+    console.error("Failed to end session:", err);
+    setSubmitError(
+      "The session could not be marked as ended. It may still show as live."
+    );
   }
+}
 
   function handleUpgrade() {
     router.push(SESSION_ROUTES.afterCreate);
@@ -372,53 +425,60 @@ export default function CreateSessionPage({
         />
       )}
 
-      {showLive && createdValues && (
-        <LiveSession
-          stream={liveStream}
-          language={createdValues.language}
-          durationSeconds={600}
-          planLabel="Free"
-          title="SPS AI Assistant"
-          onRequestAnswer={async (request) => {
-            if (!sessionId) throw new Error("Session ID is missing.");
-            const result = await answerService.ask(sessionId, request);
-            return result.answer;
-          }}
-          onTranscriptLine={(text) => {
-            setTranscript((prev) => [...prev, text]);
+    {showLive && createdValues && (
+  <LiveSession
+    stream={liveStream}
+    language={createdValues.language}
+    durationSeconds={600}
+    planLabel="Free"
+    title="SPS AI Assistant"
+    onRequestAnswer={async (request) => {
+      if (!sessionId) throw new Error("Session ID is missing.");
+      const result = await answerService.ask(sessionId, request);
+      return result.answer;
+    }}
+    onTranscribeAudio={async (payload) => {
+      if (!sessionId) return "";
+      const res = await transcribeService.chunk(sessionId, payload);
+      return res.text;
+    }}
+    onTranscriptLine={(text) => {
+      setTranscript((prev) => [...prev, text]);
 
-            if (!sessionId || !createdValues.saveTranscript) return;
-            answerService.saveTranscript(sessionId, [text]).catch(() => {});
-          }}
-          onExit={handleExitLive}
-        />
-      )}
-
-      {/* 1) Leave/End  2) AI answers feedback  3) Notes + Rate wizard */}
+      if (!sessionId || !createdValues.saveTranscript) return;
+      answerService.saveTranscript(sessionId, [text]).catch(() => {});
+    }}
+    onExit={handleExitLive}
+  />
+)}
       {showWrapUp && createdValues && (
         <SessionWrapUp
+          sessionId={sessionId}
           company={createdValues.company}
           role={createdValues.role}
           transcript={transcript}
+          details={callDetails}
           onCancel={() => setShowWrapUp(false)}
           onLeave={finishWrapUp}
           onEnd={handleEndSession}
           onFinish={finishWrapUp}
           onAnswerFeedback={async (rating) => {
-            // connect API: await answerService.sendFeedback(sessionId, rating)
             void rating;
           }}
           onAskAI={async (question) => {
-            if (!sessionId) throw new Error("Session ID is missing.");
+            if (!sessionId) {
+              throw new Error("Session ID is missing.");
+            }
+
             const result = await answerService.ask(sessionId, {
               question,
               transcript: transcript.join("\n"),
               language: createdValues.language,
             });
+
             return result.answer;
           }}
           onSubmitReview={async (review) => {
-            // connect API: await reviewService.create(sessionId, review)
             void review;
           }}
         />
