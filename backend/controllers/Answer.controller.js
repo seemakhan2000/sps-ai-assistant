@@ -1,4 +1,3 @@
-
 import { GoogleGenAI } from "@google/genai";
 import mongoose from "mongoose";
 
@@ -21,13 +20,22 @@ const ai = geminiApiKey
 const AI_MODEL =
   process.env.DEFAULT_AI_MODEL || "gemini-2.5-flash";
 
+const ALLOWED_LANGUAGES = new Set([
+  "en",
+  "es",
+  "fr",
+  "de",
+  "ar",
+  "ur",
+  "ur-roman",
+]);
+
 /* -------------------------------------------------
    ANSWER FORMAT RULES
 ------------------------------------------------- */
 
 const FORMAT_RULES = {
-  bullet_points:
-    "Answer in short, clear bullet points.",
+  bullet_points: "Answer in short, clear bullet points.",
 
   script_bullets:
     "Answer in bullet points where each bullet is a complete sentence the user can say aloud.",
@@ -85,23 +93,19 @@ function buildSystemPrompt(session) {
     "Give a direct, accurate and useful answer immediately.",
     "Do not include unnecessary introductions or preambles.",
     "Keep answers concise unless detailed information is required.",
-    FORMAT_RULES[session.answerFormat] ||
-      FORMAT_RULES.bullet_points,
-    `Reply in this language code: ${session.language || "en"}.`,
+    FORMAT_RULES[session.answerFormat] || FORMAT_RULES.bullet_points,
+    session.language === "ur-roman"
+      ? "Reply in Roman Urdu (Urdu written in English letters), not Urdu script. Keep technical terms in English."
+      : `Reply in this language code: ${session.language || "en"}.`,
   ];
 
-  if (
-    session.mode === "interview" ||
-    session.mode === "mock"
-  ) {
+  if (session.mode === "interview" || session.mode === "mock") {
     parts.push(
       `The user is in a ${session.mode} interview for the role "${session.role || ""}" at "${session.company || ""}".`
     );
 
     if (session.jobDescription) {
-      parts.push(
-        `Job description:\n${session.jobDescription}`
-      );
+      parts.push(`Job description:\n${session.jobDescription}`);
     }
   }
 
@@ -139,7 +143,6 @@ function parseImage(dataUrl) {
 
 /* -------------------------------------------------
    POST /sessions/:sessionId/answers
-   Generate AI Answer
 ------------------------------------------------- */
 
 export async function askAnswer(req, res) {
@@ -158,12 +161,10 @@ export async function askAnswer(req, res) {
       question,
       transcript = "",
       image,
+      language,
     } = req.body || {};
 
-    if (
-      typeof question !== "string" ||
-      !question.trim()
-    ) {
+    if (typeof question !== "string" || !question.trim()) {
       return res.status(400).json({
         success: false,
         message: "Question is required.",
@@ -177,9 +178,7 @@ export async function askAnswer(req, res) {
       });
     }
 
-    const imagePart = image
-      ? parseImage(image)
-      : null;
+    const imagePart = image ? parseImage(image) : null;
 
     if (image && !imagePart) {
       return res.status(400).json({
@@ -189,34 +188,34 @@ export async function askAnswer(req, res) {
       });
     }
 
+    // The language chosen on the live screen overrides the session language.
+    const answerLanguage = ALLOWED_LANGUAGES.has(language)
+      ? language
+      : session.language || "en";
+
     const parts = [
       {
         text:
           (transcript
             ? `Recent conversation:\n${String(transcript).slice(-6000)}\n\n`
-            : "") +
-          `Question:\n${question.trim()}`,
+            : "") + `Question:\n${question.trim()}`,
       },
     ];
 
     if (imagePart) {
-      parts.push({
-        inlineData: imagePart,
-      });
+      parts.push({ inlineData: imagePart });
     }
 
     const startedAt = Date.now();
 
     const response = await ai.models.generateContent({
       model: AI_MODEL,
-      contents: [
-        {
-          role: "user",
-          parts,
-        },
-      ],
+      contents: [{ role: "user", parts }],
       config: {
-        systemInstruction: buildSystemPrompt(session),
+        systemInstruction: buildSystemPrompt({
+          ...session.toObject(),
+          language: answerLanguage,
+        }),
         temperature: 0.4,
       },
     });
@@ -238,7 +237,7 @@ export async function askAnswer(req, res) {
       source: imagePart ? "screenshot" : "manual",
       hasImage: Boolean(imagePart),
       model: AI_MODEL,
-      language: session.language || "en",
+      language: answerLanguage,
       latencyMs: Date.now() - startedAt,
     });
 
@@ -255,17 +254,15 @@ export async function askAnswer(req, res) {
 
     return res.status(error.statusCode || 500).json({
       success: false,
-      message:
-        error.statusCode
-          ? error.message
-          : "Unable to generate an answer right now.",
+      message: error.statusCode
+        ? error.message
+        : "Unable to generate an answer right now.",
     });
   }
 }
 
 /* -------------------------------------------------
    GET /sessions/:sessionId/answers
-   Get Saved Answers
 ------------------------------------------------- */
 
 export async function listAnswers(req, res) {
@@ -292,17 +289,13 @@ export async function listAnswers(req, res) {
 
     return res.status(error.statusCode || 500).json({
       success: false,
-      message:
-        error.statusCode
-          ? error.message
-          : "Unable to load answers.",
+      message: error.statusCode ? error.message : "Unable to load answers.",
     });
   }
 }
 
 /* -------------------------------------------------
    POST /sessions/:sessionId/transcript
-   Save Transcript
 ------------------------------------------------- */
 
 export async function saveTranscript(req, res) {
@@ -318,9 +311,7 @@ export async function saveTranscript(req, res) {
       });
     }
 
-    const lines = Array.isArray(req.body?.lines)
-      ? req.body.lines
-      : [];
+    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
 
     if (lines.length > 50) {
       return res.status(400).json({
@@ -330,11 +321,7 @@ export async function saveTranscript(req, res) {
     }
 
     const docs = lines
-      .filter(
-        (line) =>
-          typeof line === "string" &&
-          line.trim().length > 0
-      )
+      .filter((line) => typeof line === "string" && line.trim().length > 0)
       .map((text) => ({
         sessionId: session._id,
         userId,
@@ -359,14 +346,15 @@ export async function saveTranscript(req, res) {
 
     return res.status(error.statusCode || 500).json({
       success: false,
-      message:
-        error.statusCode
-          ? error.message
-          : "Unable to save transcript.",
+      message: error.statusCode ? error.message : "Unable to save transcript.",
     });
   }
 }
-/* GET /sessions/:sessionId/transcript */
+
+/* -------------------------------------------------
+   GET /sessions/:sessionId/transcript
+------------------------------------------------- */
+
 export async function listTranscript(req, res) {
   try {
     const session = await findOwnedSession(req);
@@ -387,6 +375,7 @@ export async function listTranscript(req, res) {
     });
   } catch (error) {
     console.error("listTranscript failed:", error);
+
     return res.status(error.statusCode || 500).json({
       success: false,
       message: error.statusCode ? error.message : "Unable to load transcript.",
@@ -394,7 +383,11 @@ export async function listTranscript(req, res) {
   }
 }
 
-/* POST /sessions/:sessionId/transcribe  (tab audio chunk -> text) */
+/* -------------------------------------------------
+   POST /sessions/:sessionId/transcribe
+   Tab audio chunk -> text
+------------------------------------------------- */
+
 export async function transcribeAudio(req, res) {
   try {
     if (!ai) {
@@ -409,16 +402,25 @@ export async function transcribeAudio(req, res) {
     const { audio, mimeType = "audio/webm", language = "en" } = req.body || {};
 
     if (typeof audio !== "string" || !audio) {
-      return res.status(400).json({ success: false, message: "Audio is required." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Audio is required." });
     }
 
     if (audio.length > 900000) {
-      return res.status(413).json({ success: false, message: "Audio chunk is too large." });
+      return res
+        .status(413)
+        .json({ success: false, message: "Audio chunk is too large." });
     }
 
     if (!/^audio\/(webm|ogg|mp4|mpeg|wav)$/i.test(mimeType)) {
-      return res.status(400).json({ success: false, message: "Unsupported audio type." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Unsupported audio type." });
     }
+
+    const romanOut = language === "ur-roman";
+    const spokenLanguage = romanOut ? "ur" : language;
 
     const response = await ai.models.generateContent({
       model: AI_MODEL,
@@ -428,7 +430,10 @@ export async function transcribeAudio(req, res) {
           parts: [
             {
               text:
-                `Transcribe the speech in this audio verbatim. Language code: ${String(language).slice(0, 8)}. ` +
+                `Transcribe the speech in this audio verbatim. Language code: ${String(spokenLanguage).slice(0, 8)}. ` +
+                (romanOut
+                  ? `Write the transcript in Roman Urdu (Urdu in English letters), not Urdu script. `
+                  : ``) +
                 `Add normal punctuation. Output only the transcript text. ` +
                 `If there is no clear human speech, output exactly: NO_SPEECH`,
             },
@@ -448,7 +453,66 @@ export async function transcribeAudio(req, res) {
 
     return res.status(error.statusCode || 500).json({
       success: false,
-      message: error.statusCode ? error.message : "Unable to transcribe audio.",
+      message: error.statusCode
+        ? error.message
+        : "Unable to transcribe audio.",
+    });
+  }
+}
+
+/* -------------------------------------------------
+   POST /sessions/:sessionId/romanize
+   Urdu script -> Roman Urdu
+------------------------------------------------- */
+
+export async function romanizeText(req, res) {
+  try {
+    if (!ai) {
+      return res.status(503).json({
+        success: false,
+        message: "GEMINI_API_KEY is not configured.",
+      });
+    }
+
+    await findOwnedSession(req);
+
+    const { text } = req.body || {};
+
+    if (typeof text !== "string" || !text.trim() || text.length > 2000) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Valid text is required." });
+    }
+
+    const response = await ai.models.generateContent({
+      model: AI_MODEL,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text:
+                "Convert this text to Roman Urdu (Urdu written in English letters). " +
+                "Keep the meaning exactly the same. English words stay as they are. " +
+                "Output only the converted text, nothing else.\n\n" +
+                text.trim(),
+            },
+          ],
+        },
+      ],
+      config: { temperature: 0 },
+    });
+
+    return res.status(200).json({
+      success: true,
+      text: (response.text || "").trim(),
+    });
+  } catch (error) {
+    console.error("romanizeText failed:", error);
+
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.statusCode ? error.message : "Unable to convert text.",
     });
   }
 }

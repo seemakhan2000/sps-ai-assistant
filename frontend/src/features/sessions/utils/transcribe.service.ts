@@ -13,3 +13,11 @@ export const transcribeService = {
       { method: "POST", body: JSON.stringify(payload) }
     ),
 };
+
+export const romanizeService = {
+  text: (sessionId: string, text: string) =>
+    apiFetch<{ success: boolean; text: string }>(
+      `/sessions/${sessionId}/romanize`,
+      { method: "POST", body: JSON.stringify({ text }) }
+    ),
+};

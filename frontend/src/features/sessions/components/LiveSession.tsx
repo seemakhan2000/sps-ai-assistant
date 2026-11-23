@@ -46,6 +46,8 @@ type Props = {
   onRequestAnswer?: (request: AnswerRequest) => Promise<string>;
   /** Send a tab-audio chunk to speech-to-text. Return the transcript text. */
   onTranscribeAudio?: (request: TranscribeRequest) => Promise<string>;
+  /** Convert Urdu script text to Roman Urdu. Return the converted text. */
+  onRomanize?: (text: string) => Promise<string>;
   /** Called for every final transcript line (use it to save to the DB). */
   onTranscriptLine?: (text: string) => void;
   onExit: () => void;
@@ -79,21 +81,40 @@ const LANGUAGES = [
   { value: "de", label: "German", code: "de-DE" },
   { value: "ar", label: "Arabic", code: "ar-SA" },
   { value: "ur", label: "Urdu", code: "ur-PK" },
+  { value: "ur-roman", label: "Roman Urdu", code: "ur-PK" },
 ];
 
 const ghostBtn =
   "flex h-10 items-center gap-2 rounded-lg border border-[#1F2F5E] bg-[#0C1738]/90 px-4 text-[14px] font-medium text-[#DCE4FA] backdrop-blur transition hover:bg-[#15275A] disabled:cursor-not-allowed disabled:opacity-50";
 
 /* Tab audio is cut into chunks of this length and sent to the backend. */
-const CHUNK_MS = 8000;
+const CHUNK_MS = 5000;
 /* Chunks quieter than this (0-128 scale) are treated as silence and skipped. */
-const SILENCE_THRESHOLD = 8;
+const SILENCE_THRESHOLD = 3;
 
-const QUESTION_RE =
-  /\?|(^|[.!]\s+)(what|why|how|when|where|who|which|can|could|do|does|did|is|are|will|would|should|have|has|tell me|explain|describe|walk me|give me|difference)\b/i;
+/* -------------------------------------------------
+   Question detection (English, Roman Urdu, Urdu)
+------------------------------------------------- */
+
+/* English: question starters at the beginning of a sentence */
+const EN_RE =
+  /(^|[.!?]\s+)(what|why|how|when|where|who|whom|whose|which|can|could|do|does|did|is|are|was|were|will|would|should|shall|may|might|have|has|had|tell me|explain|describe|define|compare|walk me|give me|difference|list|name)\b/i;
+
+/* Roman Urdu / Hindi: question words anywhere in the sentence */
+const ROMAN_RE =
+  /\b(kya|kia|kiya|kyun|kyon|kyu|kiyun|kaise|kaisay|kese|kesay|kaisa|kaisi|kab|kahan|kaha|kidhar|kaun|kon|kis|kisko|kisne|kitna|kitni|kitne|konsa|kaunsa|konsi|kaunsi|batao|bataiye|bataen|batain|bata|samjhao|samjhaiye|samjhain|farq|fark|matlab)\b/i;
+
+/* Urdu / Arabic script */
+const URDU_RE =
+  /[؟?]|(کیا|کیوں|کیسے|کیسا|کیسی|کب|کہاں|کون|کس|کتنا|کتنی|کتنے|کونسا|کونسی|بتائیں|بتاؤ|بتائیے|سمجھائیں|سمجھاؤ|فرق|مطلب)/;
 
 function looksLikeQuestion(text: string) {
-  return text.trim().length > 6 && QUESTION_RE.test(text.trim());
+  const t = text.trim();
+
+  if (t.length < 5) return false;
+  if (t.includes("?") || t.includes("؟")) return true;
+
+  return EN_RE.test(t) || ROMAN_RE.test(t) || URDU_RE.test(t);
 }
 
 function formatTime(total: number) {
@@ -127,6 +148,7 @@ export default function LiveSession({
   title = "AI Assistant",
   onRequestAnswer,
   onTranscribeAudio,
+  onRomanize,
   onTranscriptLine,
   onExit,
 }: Props) {
@@ -161,6 +183,8 @@ export default function LiveSession({
   transcriptCbRef.current = onTranscriptLine;
   const transcribeRef = useRef(onTranscribeAudio);
   transcribeRef.current = onTranscribeAudio;
+  const romanizeRef = useRef(onRomanize);
+  romanizeRef.current = onRomanize;
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const answersEndRef = useRef<HTMLDivElement>(null);
 
@@ -186,6 +210,132 @@ export default function LiveSession({
     const timer = setTimeout(() => setNotice(""), 5000);
     return () => clearTimeout(timer);
   }, [notice]);
+
+  /* ---------------- Mic speech to text ---------------- */
+  /* (defined before changeTab so changeTab can stop it) */
+
+  const addLine = useCallback((rawText: string, alreadyRoman = false) => {
+    const id = ++idRef.current;
+
+    const finish = (text: string) => {
+      setLines((previous) =>
+        previous.map((line) => (line.id === id ? { ...line, text } : line))
+      );
+
+      transcriptCbRef.current?.(text);
+
+      if (autoAnswerRef.current && looksLikeQuestion(text)) {
+        requestRef.current(text);
+      }
+    };
+
+    setLines((previous) => [...previous, { id, text: rawText }]);
+
+    if (
+      langRef.current === "ur-roman" &&
+      !alreadyRoman &&
+      romanizeRef.current
+    ) {
+      romanizeRef
+        .current(rawText)
+        .then((roman) => finish(roman || rawText))
+        .catch(() => finish(rawText));
+    } else {
+      finish(rawText);
+    }
+  }, []);
+
+  const stopListening = useCallback(() => {
+    wantListeningRef.current = false;
+    recRef.current?.stop();
+    recRef.current = null;
+    setListening(false);
+    setInterim("");
+  }, []);
+
+  const startListening = useCallback(() => {
+    const Ctor =
+      (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition;
+
+    if (!Ctor) {
+      setNotice("Speech recognition works in Chrome or Edge only.");
+      return;
+    }
+
+    const rec: RecognitionLike = new Ctor();
+
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang =
+      LANGUAGES.find((item) => item.value === langRef.current)?.code ??
+      "en-US";
+
+    rec.onresult = (event) => {
+      let interimText = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        const text = String(result[0].transcript).trim();
+
+        if (result.isFinal) {
+          if (text) addLine(text);
+        } else {
+          interimText += `${text} `;
+        }
+      }
+
+      setInterim(interimText.trim());
+    };
+
+    rec.onerror = (event) => {
+      const error = String(event.error || "");
+
+      // Harmless: silence or a normal stop.
+      if (error === "no-speech" || error === "aborted") return;
+
+      wantListeningRef.current = false;
+      setListening(false);
+
+      if (error === "not-allowed" || error === "service-not-allowed") {
+        setNotice(
+          "Microphone permission was denied. Allow the mic in the browser address bar."
+        );
+      } else if (error === "audio-capture") {
+        setNotice("No microphone found, or another app is using it.");
+      } else if (error === "network") {
+        setNotice(
+          "Speech service could not be reached. Check your internet connection and try again."
+        );
+      } else {
+        setNotice(`Speech recognition error: ${error || "unknown"}.`);
+      }
+    };
+
+    rec.onend = () => {
+      if (wantListeningRef.current) {
+        try {
+          rec.start();
+        } catch {
+          setListening(false);
+        }
+      } else {
+        setListening(false);
+      }
+    };
+
+    wantListeningRef.current = true;
+    recRef.current = rec;
+
+    try {
+      rec.start();
+      setListening(true);
+    } catch {
+      wantListeningRef.current = false;
+      setListening(false);
+      setNotice("Could not start the microphone. Please try again.");
+    }
+  }, [addLine]);
 
   /* ---------------- Stream ---------------- */
 
@@ -233,7 +383,10 @@ export default function LiveSession({
         systemAudio: "include",
       } as unknown as DisplayMediaStreamOptions);
 
+      // Stop the old mic / tab listening before switching the stream.
       tabCleanupRef.current?.();
+      stopListening();
+
       streamRef.current?.getTracks().forEach((track) => track.stop());
       setAudioOn(true);
       setStream(next);
@@ -356,19 +509,6 @@ export default function LiveSession({
     );
   }
 
-  /* ---------------- Transcript lines ---------------- */
-
-  const addLine = useCallback((text: string) => {
-    const id = ++idRef.current;
-
-    setLines((previous) => [...previous, { id, text }]);
-    transcriptCbRef.current?.(text);
-
-    if (autoAnswerRef.current && looksLikeQuestion(text)) {
-      requestRef.current(text);
-    }
-  }, []);
-
   /* ---------------- Tab audio -> speech to text ---------------- */
 
   const sendChunk = useCallback(
@@ -387,9 +527,14 @@ export default function LiveSession({
           })
         ).trim();
 
-        if (text) addLine(text);
-      } catch {
-        /* skip this chunk, the next one will continue */
+        // The backend already returns Roman Urdu for "ur-roman".
+        if (text) addLine(text, true);
+      } catch (err) {
+        setNotice(
+          err instanceof Error && err.message
+            ? `Transcription failed: ${err.message}`
+            : "Transcription failed. Please try again."
+        );
       } finally {
         setInterim("");
       }
@@ -425,12 +570,18 @@ export default function LiveSession({
 
     tabCleanupRef.current?.();
 
+    // A muted track records silence, so always enable it on start.
+    streamRef.current?.getAudioTracks().forEach((t) => (t.enabled = true));
+    setAudioOn(true);
+
     const audioStream = new MediaStream([audioTrack]);
 
     // Simple volume meter so silent chunks are not sent.
     const AudioCtx =
       window.AudioContext || (window as any).webkitAudioContext;
     const ctx: AudioContext = new AudioCtx();
+    void ctx.resume();
+
     const source = ctx.createMediaStreamSource(audioStream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
@@ -508,115 +659,23 @@ export default function LiveSession({
     return true;
   }, [sendChunk]);
 
-  /* ---------------- Microphone speech to text ---------------- */
+  const hasAudio = (stream?.getAudioTracks().length ?? 0) > 0;
 
-  const stopListening = useCallback(() => {
-    wantListeningRef.current = false;
-    recRef.current?.stop();
-    recRef.current = null;
-    setListening(false);
-    setInterim("");
-  }, []);
-
-  const startListening = useCallback(() => {
-    const Ctor =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
-
-    if (!Ctor) {
-      setNotice("Speech recognition works in Chrome or Edge only.");
+  function toggleListening() {
+    if (listening) {
+      tabCleanupRef.current?.();
+      stopListening();
       return;
     }
 
-    const rec: RecognitionLike = new Ctor();
-
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang =
-      LANGUAGES.find((item) => item.value === langRef.current)?.code ??
-      "en-US";
-
-    rec.onresult = (event) => {
-      let interimText = "";
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        const text = String(result[0].transcript).trim();
-
-        if (result.isFinal) {
-          if (text) addLine(text);
-        } else {
-          interimText += `${text} `;
-        }
-      }
-
-      setInterim(interimText.trim());
-    };
-
-    rec.onerror = (event) => {
-      const error = String(event.error || "");
-
-      // Harmless: silence or a normal stop.
-      if (error === "no-speech" || error === "aborted") return;
-
-      wantListeningRef.current = false;
-      setListening(false);
-
-      if (error === "not-allowed" || error === "service-not-allowed") {
-        setNotice(
-          "Microphone permission was denied. Allow the mic in the browser address bar."
-        );
-      } else if (error === "audio-capture") {
-        setNotice("No microphone found, or another app is using it.");
-      } else if (error === "network") {
-        setNotice(
-          "Speech service could not be reached. Check your internet connection and try again."
-        );
-      } else {
-        setNotice(`Speech recognition error: ${error || "unknown"}.`);
-      }
-    };
-
-    rec.onend = () => {
-      if (wantListeningRef.current) {
-        try {
-          rec.start();
-        } catch {
-          setListening(false);
-        }
-      } else {
-        setListening(false);
-      }
-    };
-
-    wantListeningRef.current = true;
-    recRef.current = rec;
-
-    try {
-      rec.start();
-      setListening(true);
-    } catch {
-      wantListeningRef.current = false;
-      setListening(false);
-      setNotice("Could not start the microphone. Please try again.");
+    // Prefer the shared tab audio (the other person). Fall back to the mic.
+    if (hasAudio) {
+      stopListening();
+      startTabTranscription();
+    } else {
+      startListening();
     }
-  }, [addLine]);
-
- function toggleListening() {
-  if (listening) {
-    tabCleanupRef.current?.();
-    stopListening();
-    return;
   }
-
-  if (hasAudio) {
-    stopListening();
-    startTabTranscription();
-  } else {
-    startListening();
-  }
-}
-    
 
   function changeLanguage(next: string) {
     setLang(next);
@@ -672,8 +731,6 @@ export default function LiveSession({
       .catch(() => setNotice("Unable to copy."));
     setMenuOpen(false);
   }
-
-  const hasAudio = (stream?.getAudioTracks().length ?? 0) > 0;
 
   /* ---------------- Render ---------------- */
 
